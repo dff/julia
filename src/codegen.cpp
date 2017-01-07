@@ -4539,10 +4539,10 @@ static Function *jl_cfunction_object(jl_function_t *ff, jl_value_t *declrt, jl_t
     // check the cache
     jl_typemap_entry_t *sf = NULL;
     if (jl_cfunction_list.unknown != jl_nothing) {
-        sf = jl_typemap_assoc_by_type(jl_cfunction_list, (jl_tupletype_t*)cfunc_sig, NULL, 1, /*subtype*/0, /*offs*/0, /*world*/1);
-        if (sf != NULL) {
+        sf = jl_typemap_assoc_by_type(jl_cfunction_list, (jl_tupletype_t*)cfunc_sig, NULL, /*subtype*/0, /*offs*/0, /*world*/1);
+        if (sf) {
             jl_value_t *v = sf->func.value;
-            if (v != NULL) {
+            if (v) {
                 if (jl_is_svec(v))
                     v = jl_svecref(v, 0);
                 Function *f = (Function*)jl_unbox_voidpointer(v);

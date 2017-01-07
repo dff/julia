@@ -2189,409 +2189,44 @@ JL_DLLEXPORT jl_value_t *jl_type_intersection(jl_value_t *a, jl_value_t *b)
     return jl_type_intersection_env(a, b, NULL);
 }
 
-JL_DLLEXPORT jl_svec_t *jl_env_from_type_intersection(jl_value_t *a, jl_value_t *b)
+JL_DLLEXPORT jl_svec_t *jl_match_method(jl_value_t *a, jl_value_t *b)
 {
     jl_svec_t *env = jl_emptysvec;
-    JL_GC_PUSH1(&env);
-    jl_value_t *ti = jl_type_intersection_env(a, b, &env);
+    jl_value_t *ti = NULL;
+    JL_GC_PUSH2(&env, &ti);
+    ti = jl_type_intersection_env(a, b, &env);
     jl_svec_t *pair = jl_svec2(ti, env);
     JL_GC_POP();
     return pair;
 }
 
-// specificity comparison
-
-static int eq_msp(jl_value_t *a, jl_value_t *b, jl_typeenv_t *env)
+int jl_subtype_matching(jl_value_t *a, jl_value_t *b, jl_svec_t **penv)
 {
-    if (!(jl_is_type(a) || jl_is_typevar(a)) ||
-        !(jl_is_type(b) || jl_is_typevar(b)))
-        return jl_egal(a, b);
-    JL_GC_PUSH2(&a, &b);
-    jl_typeenv_t *e = env;
-    while (e != NULL) {
-        a = jl_type_unionall(e->var, a);
-        b = jl_type_unionall(e->var, b);
-        e = e->prev;
-    }
-    int eq = jl_types_equal(a, b);
-    JL_GC_POP();
-    return eq;
-}
+    int szb = penv ? jl_subtype_env_size(b) : 0;
+    if (szb == 0)
+        return jl_subtype_env(a, b, NULL, szb);
 
-static int sub_msp(jl_value_t *a, jl_value_t *b, jl_typeenv_t *env)
-{
-    JL_GC_PUSH2(&a, &b);
-    while (env != NULL) {
-        a = jl_type_unionall(env->var, a);
-        b = jl_type_unionall(env->var, b);
-        env = env->prev;
+    jl_value_t **env;
+    JL_GC_PUSHARGS(env, szb);
+    int sub = jl_subtype_env(a, b, env, szb);
+    if (sub) {
+        // copy env to svec for return
+        int i = 0;
+        jl_svec_t *e = jl_alloc_svec(szb);
+        *penv = e;
+        for (i = 0; i < szb; i++)
+            jl_svecset(e, i, env[i]);
     }
-    int sub = jl_subtype(a, b);
     JL_GC_POP();
     return sub;
 }
 
-static int type_morespecific_(jl_value_t *a, jl_value_t *b, int invariant, jl_typeenv_t *env);
-
-static int num_occurs(jl_tvar_t *v, jl_typeenv_t *env);
-
-static jl_value_t *nth_tuple_elt(jl_datatype_t *t, size_t i)
+JL_DLLEXPORT jl_value_t *jl_match_subtype(jl_value_t *type, jl_value_t *sig)
 {
-    size_t len = jl_field_count(t);
-    if (len == 0)
-        return NULL;
-    if (i < len-1)
-        return jl_tparam(t, i);
-    jl_value_t *last = jl_unwrap_unionall(jl_tparam(t, len-1));
-    if (jl_is_vararg_type(last)) {
-        jl_value_t *n = jl_tparam1(last);
-        if (jl_is_long(n) && i >= len-1+jl_unbox_long(n))
-            return NULL;
-        return jl_tparam0(last);
-    }
-    if (i == len-1)
-        return jl_tparam(t, i);
-    return NULL;
-}
-
-static int tuple_morespecific(jl_datatype_t *cdt, jl_datatype_t *pdt, int invariant, jl_typeenv_t *env)
-{
-    size_t plen = jl_nparams(pdt);
-    if (plen == 0) return 0;
-    size_t clen = jl_nparams(cdt);
-    if (clen == 0) return 1;
-    int i = 0;
-    int cva = jl_vararg_kind(jl_tparam(cdt,clen-1)) > JL_VARARG_INT;
-    int pva = jl_vararg_kind(jl_tparam(pdt,plen-1)) > JL_VARARG_INT;
-    int cdiag = 0, pdiag = 0;
-    int some_morespecific = 0;
-    while (1) {
-        if (cva && pva && i >= clen && i >= plen)
-            break;
-
-        jl_value_t *ce = nth_tuple_elt(cdt, i);
-        jl_value_t *pe = nth_tuple_elt(pdt, i);
-
-        if (ce == NULL) {
-            if (pe == NULL) break;
-            return 1;
-        }
-        if (pe == NULL) {
-            if (!cva && !some_morespecific)
-                return 0;
-            break;
-        }
-
-        if (type_morespecific_(pe, ce, invariant, env)) {
-            assert(!type_morespecific_(ce, pe, invariant, env));
-            return 0;
-        }
-
-        if (!cdiag && jl_is_typevar(ce) && num_occurs((jl_tvar_t*)ce,env) > 1)
-            cdiag = 1;
-        if (!pdiag && jl_is_typevar(pe) && num_occurs((jl_tvar_t*)pe,env) > 1)
-            pdiag = 1;
-
-        // in Tuple{a,b...} and Tuple{c,d...} allow b and d to be disjoint
-        if (cva && pva && i >= clen-1 && i >= plen-1 && (some_morespecific || (cdiag && !pdiag)))
-            return 1;
-
-        int cms = type_morespecific_(ce, pe, invariant, env);
-        int eqv = !cms && eq_msp(ce, pe, env);
-
-        if (!cms && !eqv)
-            return 0;
-
-        // Tuple{..., T} not more specific than Tuple{..., Vararg{S}} if S is diagonal
-        if (eqv && i == clen-1 && clen == plen && !cva && pva && jl_is_typevar(ce) && jl_is_typevar(pe) && !cdiag && pdiag)
-            return 0;
-
-        if (cms) some_morespecific = 1;
-        i++;
-    }
-    if (cva && pva && clen > plen && (!pdiag || cdiag))
-        return 1;
-    if (cva && !pva && !some_morespecific)
-        return 0;
-    return some_morespecific || (cdiag && !pdiag);
-}
-
-static size_t tuple_full_length(jl_value_t *t)
-{
-    size_t n = jl_nparams(t);
-    if (n == 0) return 0;
-    jl_value_t *last = jl_unwrap_unionall(jl_tparam(t,n-1));
-    if (jl_is_vararg_type(last)) {
-        jl_value_t *N = jl_tparam1(last);
-        if (jl_is_long(N))
-            n += jl_unbox_long(N)-1;
-    }
-    return n;
-}
-
-// Called when a is a bound-vararg and b is not a vararg. Sets the vararg length
-// in a to match b, as long as this makes some earlier argument more specific.
-static int args_morespecific_fix1(jl_value_t *a, jl_value_t *b, int swap, jl_typeenv_t *env)
-{
-    size_t n = jl_nparams(a);
-    int taillen = tuple_full_length(b)-n+1;
-    if (taillen <= 0)
-        return -1;
-    assert(jl_is_va_tuple((jl_datatype_t*)a));
-    jl_datatype_t *new_a = NULL;
-    jl_value_t *e[2] = { jl_tparam1(jl_unwrap_unionall(jl_tparam(a, n-1))), jl_box_long(taillen) };
-    JL_GC_PUSH2(&new_a, &e[1]);
-    new_a = (jl_datatype_t*)jl_instantiate_type_with((jl_value_t*)a, e, 1);
-    int changed = 0;
-    for (size_t i = 0; i < n-1; i++) {
-        if (jl_tparam(a, i) != jl_tparam(new_a, i)) {
-            changed = 1;
-            break;
-        }
-    }
-    int ret = -1;
-    if (changed) {
-        if (eq_msp(b, (jl_value_t*)new_a, env))
-            ret = swap;
-        else if (swap)
-            ret = type_morespecific_(b, (jl_value_t*)new_a, 0, env);
-        else
-            ret = type_morespecific_((jl_value_t*)new_a, b, 0, env);
-    }
-    JL_GC_POP();
-    return ret;
-}
-
-static int partially_morespecific(jl_value_t *a, jl_value_t *b, int invariant, jl_typeenv_t *env)
-{
-    if (jl_is_uniontype(b)) {
-        jl_uniontype_t *u = (jl_uniontype_t*)b;
-        if (type_morespecific_(a, u->a, invariant, env) ||
-            type_morespecific_(a, u->b, invariant, env))
-            return 1;
-        return 0;
-    }
-    return type_morespecific_(a, b, invariant, env);
-}
-
-static int count_occurs(jl_value_t *t, jl_tvar_t *v)
-{
-    if (t == (jl_value_t*)v)
-        return 1;
-    if (jl_is_uniontype(t)) {
-        int a = count_occurs(((jl_uniontype_t*)t)->a, v);
-        int b = count_occurs(((jl_uniontype_t*)t)->b, v);
-        return a > b ? a : b;
-    }
-    if (jl_is_unionall(t)) {
-        if (((jl_unionall_t*)t)->var == v)
-            return 0;
-        return count_occurs(((jl_unionall_t*)t)->body, v);
-    }
-    if (jl_is_datatype(t)) {
-        int i, c=0;
-        for(i=0; i < jl_nparams(t); i++)
-            c += count_occurs(jl_tparam(t,i), v);
-        return c;
-    }
-    return 0;
-}
-
-static int num_occurs(jl_tvar_t *v, jl_typeenv_t *env)
-{
-    while (env != NULL) {
-        if (env->var == v)
-            return (int)(ssize_t)env->val;
-        env = env->prev;
-    }
-    return 0;
-}
-
-static int type_morespecific_(jl_value_t *a, jl_value_t *b, int invariant, jl_typeenv_t *env)
-{
-    if (a == b)
-        return 0;
-
-    if (jl_is_unionall(a)) {
-        jl_unionall_t *ua = (jl_unionall_t*)a;
-        jl_typeenv_t newenv = { ua->var, 0x0, env };
-        newenv.val = (jl_value_t*)(intptr_t)count_occurs(ua->body, ua->var);
-        return type_morespecific_(ua->body, b, invariant, &newenv);
-    }
-    if (jl_is_unionall(b)) {
-        jl_unionall_t *ub = (jl_unionall_t*)b;
-        jl_typeenv_t newenv = { ub->var, 0x0, env };
-        newenv.val = (jl_value_t*)(intptr_t)count_occurs(ub->body, ub->var);
-        return type_morespecific_(a, ub->body, invariant, &newenv);
-    }
-
-    if (jl_is_tuple_type(a) && jl_is_tuple_type(b)) {
-        // When one is JL_VARARG_BOUND and the other has fixed length,
-        // allow the argument length to fix the tvar
-        jl_vararg_kind_t akind = jl_va_tuple_kind((jl_datatype_t*)a);
-        jl_vararg_kind_t bkind = jl_va_tuple_kind((jl_datatype_t*)b);
-        int ans = -1;
-        if (akind == JL_VARARG_BOUND && bkind < JL_VARARG_BOUND)
-            ans = args_morespecific_fix1(a, b, 0, env);
-        if (bkind == JL_VARARG_BOUND && akind < JL_VARARG_BOUND)
-            ans = args_morespecific_fix1(b, a, 1, env);
-        if (ans != -1)
-            return ans;
-        return tuple_morespecific((jl_datatype_t*)a, (jl_datatype_t*)b, invariant, env);
-    }
-
-    if (jl_is_uniontype(a)) {
-        if (sub_msp(b, a, env))
-            return 0;
-        else if (sub_msp(a, b, env))
-            return 1;
-        // Union a is more specific than b if some element of a is more specific than b,
-        // and b is not more specific than any element of a.
-        jl_uniontype_t *u = (jl_uniontype_t*)a;
-        if (partially_morespecific(u->a, b, invariant, env) && !type_morespecific_(b, u->a, invariant, env)) {
-            if (partially_morespecific(b, a, invariant, env))
-                return 0;
-            return 1;
-        }
-        if (partially_morespecific(u->b, b, invariant, env) && !type_morespecific_(b, u->b, invariant, env)) {
-            if (partially_morespecific(b, a, invariant, env))
-                return 0;
-            return 1;
-        }
-        return 0;
-    }
-
-    if (jl_is_type_type(a) && !invariant) {
-        if (b == (jl_value_t*)jl_typeofbottom_type)
-            return 0;
-        jl_value_t *tp0a = jl_tparam0(a);
-        if (jl_is_typevar(tp0a)) {
-            jl_value_t *ub = ((jl_tvar_t*)tp0a)->ub;
-            if (jl_is_kind(b) && !sub_msp((jl_value_t*)jl_any_type, ub, env))
-                return 1;
-        }
-        else if (tp0a == jl_bottom_type) {
-            if (sub_msp(b, (jl_value_t*)jl_type_type, env))
-                return 1;
-        }
-        else if (b == (jl_value_t*)jl_datatype_type || b == (jl_value_t*)jl_unionall_type ||
-                 b == (jl_value_t*)jl_uniontype_type) {
-            return 1;
-        }
-    }
-
-    if (jl_is_uniontype(b)) {
-        jl_uniontype_t *u = (jl_uniontype_t*)b;
-        if (type_morespecific_(a, u->a, invariant, env) || type_morespecific_(a, u->b, invariant, env))
-            return !type_morespecific_(b, a, invariant, env);
-        return 0;
-    }
-
-    if (!invariant) {
-        if ((jl_datatype_t*)a == jl_any_type) return 0;
-        if ((jl_datatype_t*)b == jl_any_type) return 1;
-    }
-
-    if (jl_is_datatype(a) && jl_is_datatype(b)) {
-        jl_datatype_t *tta = (jl_datatype_t*)a, *ttb = (jl_datatype_t*)b;
-        int super = 0;
-        while (tta != jl_any_type) {
-            if (tta->name == ttb->name) {
-                if (super) {
-                    if (tta->name != jl_type_typename) return 1;
-                    jl_value_t *tp0 = jl_tparam0(b);
-                    if (jl_is_typevar(tp0)) {
-                        if (sub_msp((jl_value_t*)jl_any_type, ((jl_tvar_t*)tp0)->ub, env))
-                            return 1;
-                    }
-                }
-                assert(jl_nparams(tta) == jl_nparams(ttb));
-                int ascore=0, bscore=0, ascore1=0, bscore1=0, adiag=0, bdiag=0;
-                for(size_t i=0; i < jl_nparams(tta); i++) {
-                    jl_value_t *apara = jl_tparam(tta,i);
-                    jl_value_t *bpara = jl_tparam(ttb,i);
-                    if (type_morespecific_(apara, bpara, 1, env))
-                        ascore += 1;
-                    else if (type_morespecific_(bpara, apara, 1, env))
-                        bscore += 1;
-                    if (jl_is_typevar(bpara) && !jl_is_typevar(apara) && !jl_is_type(apara))
-                        ascore1 = 1;
-                    else if (jl_is_typevar(apara) && !jl_is_typevar(bpara) && !jl_is_type(bpara))
-                        bscore1 = 1;
-                    if (!adiag && jl_is_typevar(apara)) {
-                        for(int j=i+1; j < jl_nparams(tta); j++) {
-                            if (jl_has_typevar(jl_tparam(tta,j), (jl_tvar_t*)apara)) {
-                                adiag = 1; break;
-                            }
-                        }
-                    }
-                    if (!bdiag && jl_is_typevar(bpara)) {
-                        for(int j=i+1; j < jl_nparams(ttb); j++) {
-                            if (jl_has_typevar(jl_tparam(ttb,j), (jl_tvar_t*)bpara)) {
-                                bdiag = 1; break;
-                            }
-                        }
-                    }
-                }
-                if (ascore1 > bscore1)
-                    return 1;
-                if (bscore1 > ascore1 || bscore > ascore || bdiag > adiag)
-                    return 0;
-                return ascore > bscore || adiag > bdiag;
-            }
-            else if (invariant) {
-                return 0;
-            }
-            tta = tta->super; super = 1;
-        }
-        return 0;
-    }
-
-    if (jl_is_typevar(a)) {
-        if (jl_is_typevar(b)) {
-            return (( type_morespecific_((jl_value_t*)((jl_tvar_t*)a)->ub,
-                                         (jl_value_t*)((jl_tvar_t*)b)->ub, 0, env) &&
-                     !type_morespecific_((jl_value_t*)((jl_tvar_t*)a)->lb,
-                                         (jl_value_t*)((jl_tvar_t*)b)->lb, 0, env)) ||
-                    ( type_morespecific_((jl_value_t*)((jl_tvar_t*)b)->lb,
-                                         (jl_value_t*)((jl_tvar_t*)a)->lb, 0, env) &&
-                     !type_morespecific_((jl_value_t*)((jl_tvar_t*)b)->ub,
-                                         (jl_value_t*)((jl_tvar_t*)a)->ub, 0, env)));
-        }
-        if (!jl_is_type(b))
-            return 0;
-        if (invariant) {
-            if (eq_msp(((jl_tvar_t*)a)->ub, b, env))
-                return num_occurs((jl_tvar_t*)a, env) >= 2;
-            return 0;
-        }
-        return type_morespecific_((jl_value_t*)((jl_tvar_t*)a)->ub, b, 0, env);
-    }
-    if (jl_is_typevar(b)) {
-        if (!jl_is_type(a))
-            return 1;
-        if (invariant) {
-            if (eq_msp(((jl_tvar_t*)b)->ub, a, env))
-                return num_occurs((jl_tvar_t*)b, env) < 2;
-        }
-        return type_morespecific_(a, (jl_value_t*)((jl_tvar_t*)b)->ub, 0, env);
-    }
-
-    return 0;
-}
-
-JL_DLLEXPORT int jl_type_morespecific(jl_value_t *a, jl_value_t *b)
-{
-    if (obviously_disjoint(a, b, 1))
-        return 0;
-    if (jl_subtype(b, a)) return 0;
-    if (jl_subtype(a, b)) return 1;
-    return type_morespecific_(a, b, 0, NULL);
-}
-
-JL_DLLEXPORT int jl_type_morespecific_no_subtype(jl_value_t *a, jl_value_t *b)
-{
-    return type_morespecific_(a, b, 0, NULL);
+    jl_svec_t *env = jl_emptysvec;
+    if (jl_subtype_matching(type, (jl_value_t*)sig, &env))
+        return (jl_value_t*)env;
+    return jl_false;
 }
 
 #ifdef __cplusplus
