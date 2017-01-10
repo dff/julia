@@ -1036,6 +1036,7 @@ static jl_method_instance_t *jl_mt_assoc_by_type(jl_methtable_t *mt, jl_datatype
     jl_svec_t *env = jl_emptysvec;
     jl_method_t *func = NULL;
     jl_tupletype_t *sig = NULL;
+    jl_method_instance_t *nf = NULL;
     JL_GC_PUSH4(&env, &entry, &func, &sig);
 
     entry = jl_typemap_assoc_by_type(mt->defs, tt, &env, /*subtype*/1, /*offs*/0, world);
@@ -1050,7 +1051,6 @@ static jl_method_instance_t *jl_mt_assoc_by_type(jl_methtable_t *mt, jl_datatype
             }
 #endif
             sig = join_tsig(tt, (jl_tupletype_t*)m->sig);
-            jl_method_instance_t *nf;
             if (!mt_cache) {
                 nf = jl_specializations_get_linfo(m, (jl_value_t*)sig, env, world);
             }
@@ -2042,7 +2042,7 @@ JL_DLLEXPORT jl_value_t *jl_get_invoke_lambda(jl_methtable_t *mt,
     jl_method_t *method = entry->func.method;
     jl_typemap_entry_t *tm = NULL;
     if (method->invokes.unknown != NULL) {
-        tm = jl_typemap_assoc_by_type(method->invokes, tt, NULL, 0, 1,
+        tm = jl_typemap_assoc_by_type(method->invokes, tt, NULL, /*subtype*/1,
                                       jl_cachearg_offset(mt), world);
         if (tm) {
             return (jl_value_t*)tm->func.linfo;
@@ -2051,7 +2051,7 @@ JL_DLLEXPORT jl_value_t *jl_get_invoke_lambda(jl_methtable_t *mt,
 
     JL_LOCK(&method->writelock);
     if (method->invokes.unknown != NULL) {
-        tm = jl_typemap_assoc_by_type(method->invokes, tt, NULL, 0, 1,
+        tm = jl_typemap_assoc_by_type(method->invokes, tt, NULL, /*subtype*/1,
                                       jl_cachearg_offset(mt), world);
         if (tm) {
             jl_method_instance_t *mfunc = tm->func.linfo;
@@ -2198,26 +2198,12 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
         }
     }
     if (!skip) {
-        /*
-          Check whether all static parameters matched. If not, then we
-          might have argument type `Tuple{}` and signature type `Tuple{Vararg{T}}`,
-          which doesn't match due to there being no value for `T`.
-          This is a remaining case of issue #4731 after introducing UnionAll.
-        */
-        int done = 0, return_this_match = 1;
-        jl_svec_t *env = closure->match.env;
-        if (closure0->issubty) {
-            // if the queried type is a subtype, but not all tvars matched, then
-            // this method is excluded by the static-parameters-must-have-values rule
-            if (!matched_all_tvars((jl_value_t*)ml->sig, jl_svec_data(env), jl_svec_len(env)))
-                return_this_match = !jl_is_leaf_type(closure->match.type);
-            else
-                done = 1;  // stop; signature fully covers queried type
-        }
+        int done = closure0->issubty; // stop; signature fully covers queried type
         // if we reach a definition that fully covers the arguments but there are
         // ambiguities, then this method might not actually match, so we shouldn't
         // add it to the results.
-        if (return_this_match && meth->ambig != jl_nothing && (!closure->include_ambiguous || done)) {
+        int return_this_match = 1;
+        if (meth->ambig != jl_nothing && (!closure->include_ambiguous || done)) {
             jl_svec_t *env = NULL;
             jl_value_t *mti = NULL;
             JL_GC_PUSH2(&env, &mti);
@@ -2230,7 +2216,7 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
                     if (closure->include_ambiguous) {
                         assert(done);
                         int k;
-                        for(k=0; k < len; k++) {
+                        for (k = 0; k < len; k++) {
                             if ((jl_value_t*)mambig == jl_svecref(jl_array_ptr_ref(closure->t, k), 2))
                                 break;
                         }
@@ -2269,7 +2255,8 @@ static int ml_matches_visitor(jl_typemap_entry_t *ml, struct typemap_intersectio
                 jl_array_ptr_1d_push((jl_array_t*)closure->t, (jl_value_t*)closure->matc);
             }
         }
-        if (done) return 0;
+        if (done)
+            return 0;
     }
     return 1;
 }

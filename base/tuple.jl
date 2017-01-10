@@ -63,6 +63,7 @@ first(t::Tuple) = t[1]
 # eltype
 
 eltype(::Type{Tuple{}}) = Bottom
+#eltype(::Type{Tuple{Vararg{E}}}) where {E} = E
 eltype(::Type{<:Tuple{Vararg{E}}}) where {E} = E
 function eltype(t::Type{<:Tuple})
     @_pure_meta
