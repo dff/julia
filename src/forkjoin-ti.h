@@ -9,6 +9,9 @@
 extern "C" {
 #endif
 
+// interface provided by this threading infrastructure
+JL_DLLEXPORT jl_value_t *jl_threading_run(jl_value_t *_args);
+
 
 #ifdef __cplusplus
 }

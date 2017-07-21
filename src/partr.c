@@ -12,6 +12,8 @@
 //     where it was resume()d.
 // - stack management. pool of stacks to be implemented.
 // - original task functionality to be integrated.
+//   - world_age should go into task local storage?
+//   - current_module is being obsoleted?
 
 #include <assert.h>
 #include <stdio.h>
@@ -29,11 +31,23 @@ extern "C" {
 #ifdef JULIA_ENABLE_THREADING
 #ifdef JULIA_ENABLE_PARTR
 
-/* sticky task queues need to be visible to all threads */
-jl_ptaskq_t *sticky_taskqs;
+// multiq functions
+void multiq_init();
+int multiq_insert(jl_ptask_t *elem, int16_t priority);
+jl_ptask_t *multiq_deletemin();
 
-/* forward declarations */
-static int run_next();
+// sync trees
+void synctreepool_init();
+arriver_t *arriver_alloc();
+void arriver_free(arriver_t *);
+reducer_t *reducer_alloc();
+void reducer_free(reducer_t *);
+
+int last_arriver(arriver_t *, int);
+void *reduce(arriver_t *, reducer_t *, void *(*rf)(void *, void *), void *, int);
+
+// sticky task queues need to be visible to all threads
+jl_ptaskq_t *sticky_taskqs;
 
 /* internally used to indicate a yield occurred in the runtime itself */
 static const int64_t yield_from_sync = 1;
@@ -73,6 +87,9 @@ void jl_init_started_threads(jl_threadarg_t **targs)
     // master thread final initialization
     init_started_thread();
 }
+
+
+static int run_next();
 
 
 // thread function: used by all except the main thread
@@ -206,28 +223,28 @@ static jl_ptask_t *get_from_stickyq()
 }
 
 
+static int64_t resume(jl_ptask_t *task)
+{
+    jl_ptls_t ptls = jl_get_ptls_states();
+
+    // TODO: before we support getting return value from
+    //       the work, and after we have proper GC transition
+    //       support in the codegen and runtime we don't need to
+    //       enter GC unsafe region when starting the work.
+    int8_t gc_state = jl_gc_unsafe_enter(ptls);
+
+    if (task->started) {
+    }
+    else {
+
+    jl_gc_unsafe_leave(ptls, gc_state);
+
+    return y;
+}
+
 // get the next available task and run it
 static int run_next()
 {
-#if 0
-            // TODO: before we support getting return value from
-            //       the work, and after we have proper GC transition
-            //       support in the codegen and runtime we don't need to
-            //       enter GC unsafe region when starting the work.
-            int8_t gc_state = jl_gc_unsafe_enter(ptls);
-            // This is probably always NULL for now
-            jl_module_t *last_m = ptls->current_module;
-            size_t last_age = ptls->world_age;
-            JL_GC_PUSH1(&last_m);
-            ptls->current_module = work->current_module;
-            ptls->world_age = work->world_age;
-            jl_thread_run_fun(&work->fptr, work->mfunc, work->args, work->nargs);
-            ptls->current_module = last_m;
-            ptls->world_age = last_age;
-            JL_GC_POP();
-            jl_gc_unsafe_leave(ptls, gc_state);
-#endif
-
     jl_ptls_t ptls = jl_get_ptls_states();
 
     /* first check for sticky tasks */
@@ -248,6 +265,7 @@ static int run_next()
 
     /* run/resume the task */
     ptls->curr_task = task;
+
     // TODO
     int64_t y = 0;
     // int64_t y = (int64_t)resume(task->ctx);

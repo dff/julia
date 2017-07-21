@@ -33,11 +33,7 @@ void jl_init_threadarg(jl_threadarg_t *targ);
 void jl_init_started_threads(jl_threadarg_t **targs);
 void jl_threadfun(void *arg);
 
-// original threading interface (TODO: should be obsoleted)
-JL_DLLEXPORT jl_value_t *jl_threading_run(jl_value_t *_args);
-
-// threading interfaces defined by threading infrastructures
-
+// interfaces defined by threading infrastructures
 #ifdef JULIA_ENABLE_FORKJOIN_TI
 #include "forkjoin-ti.h"
 #else
