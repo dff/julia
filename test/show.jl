@@ -818,3 +818,15 @@ end
     @test sprint(show, Val(:Float64)) == "Val{:Float64}()" # Val of a symbol
     @test sprint(show, Val(true))     == "Val{true}()"     # Val of a value
 end
+
+@testset "alignment for pairs" begin  # (#22899)
+    @test replstr([1=>22,33=>4]) == "2-element Array{Pair{Int64,Int64},1}:\n  1=>22\n 33=>4 "
+    # first field may have "=>" in its representation
+    @test replstr(Pair[(1=>2)=>3, 4=>5]) ==
+        "2-element Array{Pair,1}:\n (1=>2)=>3\n      4=>5"
+    @test replstr(Any[Dict(1=>2)=> (3=>4), 1=>2]) ==
+        "2-element Array{Any,1}:\n Dict(1=>2)=>(3=>4)\n          1=>2     "
+    # left-alignment when not using the "=>" symbol
+    @test replstr(Pair{Integer,Int}[1=>2, 33=>4]) ==
+        "2-element Array{Pair{Integer,Int64},1}:\n Pair{Integer,Int64}(1, 2) \n Pair{Integer,Int64}(33, 4)"
+end
