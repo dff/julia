@@ -1536,7 +1536,14 @@ JL_DLLEXPORT void JL_NORETURN jl_no_exc_handler(jl_value_t *e);
 typedef struct _arriver_t arriver_t;
 typedef struct _reducer_t reducer_t;
 
+typedef struct _jl_ptaskq_t jl_ptaskq_t;
+typedef struct _jl_ptaskq_t jl_condition_t;
 typedef struct _jl_ptask_t jl_ptask_t;
+
+struct _jl_ptaskq_t {
+    jl_ptask_t *head;
+    jl_mutex_t lock;
+};
 
 struct _jl_ptask_t {
     /* to link this task into queues */
@@ -1544,13 +1551,24 @@ struct _jl_ptask_t {
 
     /* TODO: context and stack */
 
-    /* task entry point, arguments, result, reduction function */
-    void    *(*f)(void *, int64_t, int64_t);
-    void    *arg, *result;
+    /* state */
+    size_t started:1;
+
+    /* task entry point, arguments, result, etc. */
+    jl_method_instance_t *mfunc;
+    jl_generic_fptr_t fptr;
+    jl_value_t *args;
+    jl_value_t *result;
+    jl_module_t *current_module;
+    size_t world_age;
+
+    /* grain's range, for parfors */
     int64_t start, end;
 
     /* reduction function, for parfors */
-    void    *(*rf)(void *, void *);
+    jl_method_instance_t *mredfunc;
+    jl_generic_fptr_t rfptr;
+    jl_value_t *rargs;
 
     /* parent (first) task of a parfor set */
     jl_ptask_t *parent;
@@ -1560,11 +1578,10 @@ struct _jl_ptask_t {
     reducer_t *red;
 
     /* parfor reduction result */
-    void *red_result;
+    jl_value_t *red_result;
 
-    /* completion queue and lock */
-    jl_ptask_t *cq;
-    int8_t  cq_lock;
+    /* completion queue */
+    jl_ptaskq_t cq;
 
     /* task settings */
     int8_t  settings;
@@ -1577,9 +1594,6 @@ struct _jl_ptask_t {
 
     /* for the multiqueue */
     int16_t prio;
-
-    /* to manage task pools */
-    int16_t pool, index, next_avail;
 };
 #endif // JULIA_ENABLE_PARTR
 

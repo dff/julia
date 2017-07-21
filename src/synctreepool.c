@@ -126,7 +126,7 @@ arriver_t *arriver_alloc()
     arriver_t *arr;
 
     do {
-        candidate = jl_atomic_load_n(&next_arriver);
+        candidate = jl_atomic_load(&next_arriver);
         if (candidate == -1)
             return NULL;
         arr = &arriverpool[candidate];
@@ -155,12 +155,12 @@ reducer_t *reducer_alloc()
     reducer_t *red;
 
     do {
-        candidate = jl_atomic_load_n(&next_reducer, __ATOMIC_SEQ_CST);
+        candidate = jl_atomic_load(&next_reducer);
         if (candidate == -1)
             return NULL;
         red = &reducerpool[candidate];
     } while (!jl_atomic_bool_compare_exchange(&next_reducer,
-                     &candidate, red->next_avail));
+                     candidate, red->next_avail));
     return red;
 }
 

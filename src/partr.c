@@ -1,5 +1,18 @@
 // This file is a part of Julia. License is MIT: https://julialang.org/license
 
+// TODO:
+// - coroutine integration. partr uses:
+//   - ctx_construct(): establish the context for a coroutine, with an entry
+//     point (partr_coro()), a stack, and a user data pointer (which is the
+//     task pointer).
+//   - ctx_get_user_ptr(): get the user data pointer (the task pointer).
+//   - ctx_is_done(): has the coroutine ended?
+//   - resume(): starts/resumes the coroutine specified by the passed context.
+//   - yield()/yield_value(): causes the calling coroutine to yield back to
+//     where it was resume()d.
+// - stack management. pool of stacks to be implemented.
+// - original task functionality to be integrated.
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,12 +29,8 @@ extern "C" {
 #ifdef JULIA_ENABLE_THREADING
 #ifdef JULIA_ENABLE_PARTR
 
-/* the `start` task */
-jl_ptask_t *start_task;
-
 /* sticky task queues need to be visible to all threads */
-jl_ptask_t ***all_taskqs;
-int8_t     **all_taskq_locks;
+jl_ptaskq_t *sticky_taskqs;
 
 /* forward declarations */
 static int run_next();
@@ -37,9 +46,8 @@ void jl_init_threadinginfra(void)
     synctreepool_init();
     multiq_init();
 
-    /* allocate per-thread task queues, for sticky tasks */
-    all_taskqs = (jl_ptask_t ***)jl_malloc_aligned(jl_n_threads * sizeof(jl_ptask_t **), 64);
-    all_taskq_locks = (int8_t **)jl_malloc_aligned(jl_n_threads * sizeof(int8_t *), 64);
+    /* allocate sticky task queues */
+    sticky_taskqs = (jl_ptaskq_t *)jl_malloc_aligned(jl_n_threads * sizeof(jl_ptaskq_t), 64);
 }
 
 
@@ -54,13 +62,8 @@ static void init_started_thread()
 
     /* allocate this thread's sticky task queue pointer and initialize the lock */
     seed_cong(&ptls->rngseed);
-    ptls->sticky_taskq_lock = (int8_t *)
-            jl_malloc_aligned(sizeof(int8_t) + sizeof(jl_ptask_t *), 64);
-    ptls->sticky_taskq = (jl_ptask_t **)(ptls->sticky_taskq_lock + sizeof(int8_t));
-    jl_atomic_clear(ptls->sticky_taskq_lock);
-    *ptls->sticky_taskq = NULL;
-    all_taskqs[ptls->tid] = ptls->sticky_taskq;
-    all_taskq_locks[ptls->tid] = ptls->sticky_taskq_lock;
+    ptls->sticky_taskq = &sticky_taskqs[ptls->tid];
+    ptls->sticky_taskq->head = NULL;
 }
 
 
@@ -91,7 +94,7 @@ void jl_threadfun(void *arg)
 
     init_started_thread();
 
-    // Assuming the functions called below doesn't contain unprotected GC
+    // Assuming the functions called below don't contain unprotected GC
     // critical region. In general, the following part of this function
     // shouldn't call any managed code without calling `jl_gc_unsafe_enter`
     // first.
@@ -104,13 +107,10 @@ void jl_threadfun(void *arg)
     /* get the highest priority task and run it */
     while (run_next() == 0)
         ;
-
-    /* free the sticky task queue pointer (and its lock) */
-    jl_free_aligned(ptls->sticky_taskq_lock);
 }
 
 
-// old threading interface: run specified function in all threads. partr created
+// old threading interface: run specified function in all threads. partr creates
 // jl_n_threads tasks and enqueues them; these may not actually run in all the
 // threads.
 JL_DLLEXPORT jl_value_t *jl_threading_run(jl_value_t *_args)
@@ -124,7 +124,7 @@ JL_DLLEXPORT jl_value_t *jl_threading_run(jl_value_t *_args)
 static void partr_coro(void *ctx)
 {
     jl_ptask_t *task = (jl_ptask_t *)ctx; // TODO. ctx_get_user_ptr(ctx);
-    task->result = task->f(task->arg, task->start, task->end);
+    //task->result = task->f(task->arg, task->start, task->end);
 
     /* grain tasks must synchronize */
     if (task->grain_num >= 0) {
@@ -132,8 +132,8 @@ static void partr_coro(void *ctx)
 
         /* reduce... */
         if (task->red) {
-            task->result = reduce(task->arr, task->red, task->rf,
-                                  task->result, task->grain_num);
+            // TODO. task->result = reduce(task->arr, task->red, task->rf,
+            //                             task->result, task->grain_num);
             /*  if this task is last, set the result in the parent task */
             if (task->result) {
                 task->parent->red_result = task->result;
@@ -153,6 +153,7 @@ static void partr_coro(void *ctx)
                 multiq_insert(task->parent, 0);
             }
             /* the parent task was last; it can just end */
+            // TODO: free arriver/reducer when task completes
         }
         else {
             /* the parent task needs to wait */
@@ -164,90 +165,42 @@ static void partr_coro(void *ctx)
 }
 
 
-// allocate and initialize a task
-static jl_ptask_t *setup_task(void *(*f)(void *, int64_t, int64_t), void *arg,
-        int64_t start, int64_t end)
-{
-    jl_ptask_t *task = NULL; // TODO. task_alloc();
-    if (task == NULL)
-        return NULL;
-
-    // TODO. ctx_construct(task->ctx, task->stack, TASK_STACK_SIZE, partr_coro, task);
-    task->f = f;
-    task->arg = arg;
-    task->start = start;
-    task->end = end;
-    task->sticky_tid = -1;
-    task->grain_num = -1;
-
-    return task;
-}
-
-
-// free a task
-static void *release_task(jl_ptask_t *task)
-{
-    void *result = task->result;
-    // TODO. ctx_destruct(task->ctx);
-    if (task->grain_num == 0  &&  task->red)
-        reducer_free(task->red);
-    if (task->grain_num == 0  &&  task->arr)
-        arriver_free(task->arr);
-    task->f = NULL;
-    task->arg = task->result = task->red_result = NULL;
-    task->start = task->end = 0;
-    task->rf = NULL;
-    task->parent = task->cq = NULL;
-    task->arr = NULL;
-    task->red = NULL;
-    // TODO. task_free(task);
-    return result;
-}
-
-
 // add the specified task to the sticky task queue
-static void add_to_taskq(jl_ptask_t *task)
+static void add_to_stickyq(jl_ptask_t *task)
 {
     assert(task->sticky_tid != -1);
 
-    jl_ptask_t **q = all_taskqs[task->sticky_tid];
-    int8_t *lock = all_taskq_locks[task->sticky_tid];
-
-    while (jl_atomic_test_and_set(lock))
-        jl_cpu_pause();
-
-    if (*q == NULL)
-        *q = task;
+    jl_ptaskq_t *q = &sticky_taskqs[task->sticky_tid];
+    JL_LOCK(&q->lock);
+    if (q->head == NULL)
+        q->head = task;
     else {
-        jl_ptask_t *pt = *q;
+        jl_ptask_t *pt = q->head;
         while (pt->next)
             pt = pt->next;
         pt->next = task;
     }
-
-    jl_atomic_clear(lock);
+    JL_UNLOCK(&q->lock);
 }
 
 
 // pop the first task off the sticky task queue
-static jl_ptask_t *get_from_taskq()
+static jl_ptask_t *get_from_stickyq()
 {
     jl_ptls_t ptls = jl_get_ptls_states();
+    jl_ptaskq_t *q = ptls->sticky_taskq;
 
     /* racy check for quick path */
-    if (*ptls->sticky_taskq == NULL)
+    if (q->head == NULL)
         return NULL;
 
-    while (jl_atomic_test_and_set(ptls->sticky_taskq_lock))
-        jl_cpu_pause();
-
-    jl_ptask_t *task = *ptls->sticky_taskq;
+    JL_LOCK(&q->lock);
+    jl_ptask_t *task = q->head;
     if (task) {
-        *ptls->sticky_taskq = task->next;
+        q->head = task->next;
         task->next = NULL;
     }
-
-    jl_atomic_clear(ptls->sticky_taskq_lock);
+    JL_UNLOCK(&q->lock);
 
     return task;
 }
@@ -278,7 +231,7 @@ static int run_next()
     jl_ptls_t ptls = jl_get_ptls_states();
 
     /* first check for sticky tasks */
-    jl_ptask_t *task = get_from_taskq();
+    jl_ptask_t *task = get_from_stickyq();
 
     /* no sticky tasks, go to the multiq */
     if (task == NULL) {
@@ -295,7 +248,9 @@ static int run_next()
 
     /* run/resume the task */
     ptls->curr_task = task;
-    int64_t y = 0; // TODO. (int64_t)resume(task->ctx);
+    // TODO
+    int64_t y = 0;
+    // int64_t y = (int64_t)resume(task->ctx);
     ptls->curr_task = NULL;
 
     /* if the task isn't done, it is either in a CQ, or must be re-queued */
@@ -304,7 +259,7 @@ static int run_next()
         if (y != yield_from_sync) {
             /* sticky tasks go to the thread's sticky queue */
             if (task->settings & TASK_IS_STICKY)
-                add_to_taskq(task);
+                add_to_stickyq(task);
             /* all others go back into the multiq */
             else
                 multiq_insert(task, task->prio);
@@ -312,72 +267,93 @@ static int run_next()
         return 0;
     }
 
-    /* The task completed. As detached tasks cannot be synced, clean
-       those up here.
+    /* The task completed. Detached tasks cannot be synced, so nothing will
+       be in their CQs.
      */
-    if (task->settings & TASK_IS_DETACHED) {
-        release_task(task);
+    if (task->settings & TASK_IS_DETACHED)
         return 0;
-    }
 
     /* add back all the tasks in this one's completion queue */
-    while (__atomic_test_and_set(&task->cq_lock, __ATOMIC_ACQUIRE))
-        jl_cpu_pause();
-    jl_ptask_t *cqtask, *cqnext;
-    cqtask = task->cq;
-    task->cq = NULL;
+    JL_LOCK(&task->cq.lock);
+    jl_ptask_t *cqtask = task->cq.head;
+    task->cq.head = NULL;
+    JL_UNLOCK(&task->cq.lock);
+
+    jl_ptask_t *cqnext;
     while (cqtask) {
         cqnext = cqtask->next;
         cqtask->next = NULL;
         if (cqtask->settings & TASK_IS_STICKY)
-            add_to_taskq(cqtask);
+            add_to_stickyq(cqtask);
         else
             multiq_insert(cqtask, cqtask->prio);
         cqtask = cqnext;
     }
-    __atomic_clear(&task->cq_lock, __ATOMIC_RELEASE);
 
     return 0;
 }
 
 
-/*  partr_start() -- the runtime entry point
-
-    To be called from thread 0, before creating any tasks. Wraps into
-    a task and invokes `f(arg)`; tasks should only be spawned/synced
-    from within tasks.
- */
-int partr_start(void **ret, void *(*f)(void *, int64_t, int64_t),
-        void *arg, int64_t start, int64_t end)
+// specialize and compile the user function
+static int setup_task_fun(jl_value_t *_args, jl_method_instance_t **mfunc,
+                          jl_generic_fptr_t *fptr)
 {
-    assert(tid == 0);
-
     jl_ptls_t ptls = jl_get_ptls_states();
 
-    start_task = setup_task(f, arg, start, end);
-    if (start_task == NULL)
-        return -1;
-    start_task->settings |= TASK_IS_STICKY;
-    start_task->sticky_tid = ptls->tid;
-
-    ptls->curr_task = start_task;
-    int64_t y = 0; // TODO. (int64_t)resume(start_task->ctx);
-    ptls->curr_task = NULL;
-
-    if (0 /* TODO. !ctx_is_done(start_task->ctx) */) {
-        if (y != yield_from_sync) {
-            add_to_taskq(start_task);
-        }
-        while (run_next() == 0)
-            if (0 /* TODO. ctx_is_done(start_task->ctx) */)
-                break;
+    uint32_t nargs;
+    jl_value_t **args;
+    if (!jl_is_svec(_args)) {
+        nargs = 1;
+        args = &_args;
+    }
+    else {
+        nargs = jl_svec_len(_args);
+        args = jl_svec_data(_args);
     }
 
-    void *r = release_task(start_task);
-    if (ret)
-        *ret = r;
+    *mfunc = jl_lookup_generic(args, nargs,
+                               jl_int32hash_fast(jl_return_address()), ptls->world_age);
 
-    return 0;
+    // Ignore constant return value for now.
+    if (jl_compile_method_internal(fptr, *mfunc))
+        return 0;
+
+    return 1;
+}
+
+
+// allocate and initialize a task
+static jl_ptask_t *new_task(jl_value_t *_args)
+{
+    jl_ptls_t ptls = jl_get_ptls_states();
+
+    // TODO: using jl_task_type below, assuming task and ptask will be merged
+    jl_ptask_t *task = (jl_ptask_t *)jl_gc_alloc(ptls, sizeof (jl_ptask_t),
+                                                 jl_task_type);
+    // TODO. ctx_construct(task->ctx, task->stack, TASK_STACK_SIZE, partr_coro, task);
+    if (!setup_task_fun(_args, &task->mfunc, &task->fptr))
+        return NULL;
+    task->args = _args;
+    task->result = jl_nothing;
+    task->current_module = ptls->current_module;
+    task->world_age = ptls->world_age;
+    task->sticky_tid = -1;
+    task->grain_num = -1;
+
+    return task;
+}
+
+
+// allocate a task and copy the specified task's contents into it
+static jl_ptask_t *copy_task(jl_ptask_t *ft)
+{
+    jl_ptls_t ptls = jl_get_ptls_states();
+
+    // TODO: using jl_task_type below, assuming task and ptask will be merged
+    jl_ptask_t *task = (jl_ptask_t *)jl_gc_alloc(ptls, sizeof (jl_ptask_t),
+                                                 jl_task_type);
+    memcpy(task, ft, sizeof (jl_ptask_t));
+    return task;
 }
 
 
@@ -387,12 +363,11 @@ int partr_start(void **ret, void *(*f)(void *, int64_t, int64_t),
     else that's currently running. If `detach` is set, the spawned task
     will not be returned (and cannot be synced). Yields.
  */
-int partr_spawn(partr_t *t, void *(*f)(void *, int64_t, int64_t),
-        void *arg, int64_t start, int64_t end, int8_t sticky, int8_t detach)
+int partr_spawn(partr_t *t, jl_value_t *_args, int8_t sticky, int8_t detach)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
 
-    jl_ptask_t *task = setup_task(f, arg, start, end);
+    jl_ptask_t *task = new_task(_args);
     if (task == NULL)
         return -1;
     if (sticky)
@@ -401,7 +376,6 @@ int partr_spawn(partr_t *t, void *(*f)(void *, int64_t, int64_t),
         task->settings |= TASK_IS_DETACHED;
 
     if (multiq_insert(task, ptls->tid) != 0) {
-        release_task(task);
         return -2;
     }
 
@@ -420,7 +394,7 @@ int partr_spawn(partr_t *t, void *(*f)(void *, int64_t, int64_t),
 
     Returns only when task `t` has completed.
  */
-int partr_sync(void **r, partr_t t, int done_with_task)
+int partr_sync(void **r, partr_t t)
 {
     jl_ptask_t *task = (jl_ptask_t *)t;
 
@@ -432,38 +406,33 @@ int partr_sync(void **r, partr_t t, int done_with_task)
      */
     if (0 /* TODO. !ctx_is_done(task->ctx) */) {
         ptls->curr_task->next = NULL;
-        while (jl_atomic_test_and_set(&task->cq_lock))
-            jl_cpu_pause();
+        JL_LOCK(&task->cq.lock);
 
         /* ensure the task didn't finish before we got the lock */
         if (0 /* TODO. !ctx_is_done(task->ctx) */) {
             /* add the current task to the CQ */
-            if (task->cq == NULL)
-                task->cq = ptls->curr_task;
+            if (task->cq.head == NULL)
+                task->cq.head = ptls->curr_task;
             else {
-                jl_ptask_t *pt = task->cq;
+                jl_ptask_t *pt = task->cq.head;
                 while (pt->next)
                     pt = pt->next;
                 pt->next = ptls->curr_task;
             }
 
-            /* unlock the CQ and yield the current task */
-            jl_atomic_clear(&task->cq_lock);
+            JL_UNLOCK(&task->cq.lock);
+            /* yield point */
             // TODO. yield_value(ptls->curr_task->ctx, (void *)yield_from_sync);
         }
 
         /* the task finished before we could add to its CQ */
         else
-            jl_atomic_clear(&task->cq_lock);
+            JL_UNLOCK(&task->cq.lock);
     }
 
     if (r)
         *r = task->grain_num >= 0 && task->red ?
                 task->red_result : task->result;
-
-    if (done_with_task)
-        release_task(task);
-
     return 0;
 }
 
@@ -474,8 +443,7 @@ int partr_sync(void **r, partr_t t, int done_with_task)
     for all tasks is `count`. Uses `rf()`, if provided, to reduce the return
     values from the tasks, and returns the result. Yields.
  */
-int partr_parfor(partr_t *t, void *(*f)(void *, int64_t, int64_t),
-        void *arg, int64_t count, void *(*rf)(void *, void *))
+int partr_parfor(partr_t *t, jl_value_t *_args, int64_t count, jl_value_t *_rargs)
 {
     jl_ptls_t ptls = jl_get_ptls_states();
 
@@ -487,11 +455,18 @@ int partr_parfor(partr_t *t, void *(*f)(void *, int64_t, int64_t),
     if (arr == NULL)
         return -1;
     reducer_t *red = NULL;
-    if (rf != NULL) {
+    jl_method_instance_t *mredfunc;
+    jl_generic_fptr_t rfptr;
+    if (_rargs != NULL) {
         red = reducer_alloc();
         if (red == NULL) {
             arriver_free(arr);
             return -2;
+        }
+        if (!setup_task_fun(_rargs, &mredfunc, &rfptr)) {
+            reducer_free(red);
+            arriver_free(arr);
+            return -3;
         }
     }
 
@@ -500,25 +475,26 @@ int partr_parfor(partr_t *t, void *(*f)(void *, int64_t, int64_t),
     int64_t start = 0, end;
     for (int64_t i = 0;  i < n;  ++i) {
         end = start + each.quot + (i < each.rem ? 1 : 0);
-        jl_ptask_t *task = setup_task(f, arg, start, end);
+        jl_ptask_t *task;
+        if (*t == NULL)
+            *t = task = new_task(_args);
+        else
+            task = copy_task(*t);
         if (task == NULL)
-            return -1;
+            return -4;
 
-        /* The first task is the parent (root) task of the parfor, thus only
-           this can be synced. So, we create the remaining tasks detached.
-         */
-        if (*t == NULL) *t = task;
-        else task->settings = TASK_IS_DETACHED;
-
+        task->start = start;
+        task->end = end;
         task->parent = *t;
         task->grain_num = i;
-        task->rf = rf;
+        task->mredfunc = mredfunc;
+        task->rfptr = rfptr;
+        task->rargs = _rargs;
         task->arr = arr;
         task->red = red;
 
         if (multiq_insert(task, ptls->tid) != 0) {
-            release_task(task);
-            return -3;
+            return -5;
         }
 
         start = end;
