@@ -1591,6 +1591,9 @@ end
 @deprecate readstring(filename::AbstractString) read(filename, String)
 @deprecate readstring(cmd::AbstractCmd) read(cmd, String)
 
+# issue #6466
+# `write` on non-isbits arrays is deprecated in io.jl.
+
 # END 0.7 deprecations
 
 # BEGIN 1.0 deprecations
