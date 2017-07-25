@@ -721,4 +721,4 @@ julia> countnz(A)
 6
 ```
 """
-countnz(a) = count(x -> x != 0, a)
+countnz(a) = count(!iszero, a)
