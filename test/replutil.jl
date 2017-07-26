@@ -281,9 +281,9 @@ let undefvar
     err_str = @except_str 0::7 TypeError
     @test err_str == "TypeError: typeassert: expected Type, got $Int"
     err_str = @except_str "" <: AbstractString TypeError
-    @test err_str == "TypeError: issubtype: expected Type, got String"
+    @test err_str == "TypeError: <:: expected Type, got String"
     err_str = @except_str AbstractString <: "" TypeError
-    @test err_str == "TypeError: issubtype: expected Type, got String"
+    @test err_str == "TypeError: <:: expected Type, got String"
     err_str = @except_str Type{""} TypeError
     @test err_str == "TypeError: Type: in parameter, expected Type, got String"
     err_str = @except_str TypeWithIntParam{Any} TypeError
